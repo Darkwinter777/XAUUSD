@@ -1,0 +1,207 @@
+//@version=5
+// XAUUSD Quant Signal
+// Mengikuti aturan di CLAUDE.md repo ini:
+//  1. Bias tren EMA 200 (counter-trend hanya saat sideways + harga di ekstrem BB)
+//  2. Entry: koreksi ke Bollinger Bands + divergence RSI atau rejection candle
+//  3. Rugi maksimal per trade tetap ($20), SL 2x ATR(14), TP1 0.5R / TP2 1R / TP3 2R
+//  4. DXY wajib berlawanan arah dengan rencana trade
+// Semua sinyal hanya dihitung saat candle close, jadi tidak repaint.
+// Sinyal divergence muncul "Pivot kanan" candle setelah puncak/lembah RSI,
+// karena pivot baru pasti setelah candle-candle itu close.
+indicator("XAUUSD Quant Signal", overlay = true, max_lines_count = 50, max_labels_count = 300)
+
+// ---------- Input ----------
+grpEntry  = "Tren & Entry"
+emaLen    = input.int(200, "EMA tren", minval = 1, group = grpEntry)
+bbLen     = input.int(20, "BB length", minval = 1, group = grpEntry)
+bbMult    = input.float(2.0, "BB multiplier", minval = 0.1, step = 0.1, group = grpEntry)
+rsiLen    = input.int(14, "RSI length", minval = 1, group = grpEntry)
+pivL      = input.int(5, "Pivot RSI kiri", minval = 1, group = grpEntry)
+pivR      = input.int(3, "Pivot RSI kanan (delay sinyal)", minval = 1, group = grpEntry)
+rangeMin  = input.int(5, "Jarak min antar pivot", minval = 1, group = grpEntry)
+rangeMax  = input.int(60, "Jarak maks antar pivot", minval = 1, group = grpEntry)
+useRej    = input.bool(true, "Pakai rejection candle sebagai trigger", group = grpEntry)
+wickRatio = input.float(0.5, "Rejection: panjang ekor min (x range candle)", minval = 0.1, maxval = 0.95, step = 0.05, group = grpEntry)
+
+grpCt     = "Counter-trend"
+allowCt   = input.bool(true, "Izinkan counter-trend saat sideways", group = grpCt)
+sideLen   = input.int(50, "Sideways: kemiringan EMA dicek sejak N candle", minval = 1, group = grpCt)
+sideAtr   = input.float(1.0, "Sideways: EMA bergerak kurang dari ATR x", minval = 0.1, step = 0.1, group = grpCt)
+
+grpRisk   = "Risk"
+atrLen    = input.int(14, "ATR length", minval = 1, group = grpRisk)
+atrMult   = input.float(2.0, "SL = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+maxLoss   = input.float(20, "Rugi maksimal per trade (USD)", minval = 0.01, group = grpRisk)
+contract  = input.float(100, "Ukuran kontrak (oz per lot)", minval = 0.01, group = grpRisk)
+minLot    = input.float(0.01, "Lot minimum", minval = 0.001, step = 0.001, group = grpRisk)
+lotStep   = input.float(0.01, "Kelipatan lot", minval = 0.001, step = 0.001, group = grpRisk)
+
+grpMkt    = "Intermarket"
+useDxy    = input.bool(true, "Filter DXY (wajib berlawanan)", group = grpMkt)
+dxySym    = input.symbol("TVC:DXY", "Simbol DXY", group = grpMkt)
+useYield  = input.bool(false, "Filter US10Y (opsional)", group = grpMkt)
+yieldSym  = input.symbol("TVC:US10Y", "Simbol US10Y", group = grpMkt)
+mktLen    = input.int(20, "EMA penentu arah DXY/US10Y", minval = 1, group = grpMkt)
+
+// ---------- Indikator ----------
+ema200 = ta.ema(close, emaLen)
+[bbMid, bbUp, bbLo] = ta.bb(close, bbLen, bbMult)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+plot(ema200, "EMA 200", color = color.orange, linewidth = 2)
+pUp = plot(bbUp, "BB atas", color = color.new(color.blue, 40))
+plot(bbMid, "BB tengah", color = color.blue)
+pLo = plot(bbLo, "BB bawah", color = color.new(color.blue, 40))
+fill(pUp, pLo, color = color.new(color.blue, 93))
+
+// Arah DXY / US10Y: close di atas EMA = naik (1), di bawah = turun (-1)
+dxyDir   = request.security(dxySym, timeframe.period, math.sign(close - ta.ema(close, mktLen)))
+yieldDir = request.security(yieldSym, timeframe.period, math.sign(close - ta.ema(close, mktLen)))
+
+// ---------- Trigger 1: divergence RSI ----------
+inRange(cond) =>
+    bars = ta.barssince(cond)
+    rangeMin <= bars and bars <= rangeMax
+
+phFound   = not na(ta.pivothigh(rsi, pivL, pivR))
+plFound   = not na(ta.pivotlow(rsi, pivL, pivR))
+phInRange = inRange(phFound[1])
+plInRange = inRange(plFound[1])
+
+prevRsiPH  = ta.valuewhen(phFound, rsi[pivR], 1)
+prevHighPH = ta.valuewhen(phFound, high[pivR], 1)
+prevRsiPL  = ta.valuewhen(plFound, rsi[pivR], 1)
+prevLowPL  = ta.valuewhen(plFound, low[pivR], 1)
+
+// Bearish: harga higher high, RSI lower high. Bullish: harga lower low, RSI higher low.
+bearDiv = phFound and phInRange and rsi[pivR] < prevRsiPH and high[pivR] > prevHighPH
+bullDiv = plFound and plInRange and rsi[pivR] > prevRsiPL and low[pivR] < prevLowPL
+
+// ---------- Trigger 2: rejection candle ----------
+candleRange = high - low
+upperWick   = high - math.max(open, close)
+lowerWick   = math.min(open, close) - low
+bearRej = useRej and candleRange > 0 and upperWick >= wickRatio * candleRange
+bullRej = useRej and candleRange > 0 and lowerWick >= wickRatio * candleRange
+
+// Trigger hanya dihitung jika harga sudah koreksi ke BB tengah atau lebih jauh
+sellDivOk = bearDiv and high[pivR] >= bbMid[pivR]
+sellRejOk = bearRej and high >= bbMid
+buyDivOk  = bullDiv and low[pivR] <= bbMid[pivR]
+buyRejOk  = bullRej and low <= bbMid
+sellTrig  = sellDivOk or sellRejOk
+buyTrig   = buyDivOk or buyRejOk
+
+sellAtUpper = (sellDivOk and high[pivR] >= bbUp[pivR]) or (sellRejOk and high >= bbUp)
+buyAtLower  = (buyDivOk and low[pivR] <= bbLo[pivR]) or (buyRejOk and low <= bbLo)
+
+// ---------- Filter ----------
+sideways  = math.abs(ema200 - ema200[sideLen]) < sideAtr * atr
+sellIsCt  = close >= ema200
+buyIsCt   = close <= ema200
+sellTrend = not sellIsCt or (allowCt and sideways and sellAtUpper)
+buyTrend  = not buyIsCt or (allowCt and sideways and buyAtLower)
+dxySellOk = not useDxy or dxyDir > 0
+dxyBuyOk  = not useDxy or dxyDir < 0
+ylSellOk  = not useYield or yieldDir > 0
+ylBuyOk   = not useYield or yieldDir < 0
+
+// ---------- Risk: SL 2x ATR, lot disesuaikan agar rugi <= maxLoss ----------
+maxPts  = maxLoss / (minLot * contract)
+slAtr   = atrMult * atr
+lotAtr  = math.floor(maxLoss / (slAtr * contract) / lotStep + 1e-9) * lotStep
+slFull  = lotAtr >= minLot
+slDist  = slFull ? slAtr : maxPts
+lotSize = slFull ? lotAtr : minLot
+// Jika lot minimum pun terlalu besar, SL dipersempit ke maxPts asalkan masih >= 1x ATR
+slOk    = slFull or maxPts >= atr
+
+confirmed  = barstate.isconfirmed
+sellSignal = confirmed and sellTrig and close > bbLo and sellTrend and dxySellOk and ylSellOk and slOk
+buySignal  = confirmed and buyTrig and close < bbUp and buyTrend and dxyBuyOk and ylBuyOk and slOk
+conflict   = sellSignal and buySignal
+
+sellReason = close <= bbLo ? "harga sudah di BB bawah (mengejar harga)" :
+     not sellTrend ? "harga di atas EMA 200, counter-trend butuh sideways + BB atas" :
+     not dxySellOk ? "DXY tidak naik (searah dengan Sell emas)" :
+     not ylSellOk ? "US10Y tidak naik" :
+     not slOk ? "SL " + str.tostring(maxPts, "#.0") + " poin lebih kecil dari 1x ATR" : ""
+buyReason = close >= bbUp ? "harga sudah di BB atas (mengejar harga)" :
+     not buyTrend ? "harga di bawah EMA 200, counter-trend butuh sideways + BB bawah" :
+     not dxyBuyOk ? "DXY tidak turun (searah dengan Buy emas)" :
+     not ylBuyOk ? "US10Y tidak turun" :
+     not slOk ? "SL " + str.tostring(maxPts, "#.0") + " poin lebih kecil dari 1x ATR" : ""
+
+// ---------- Kartu sinyal & level ----------
+fmt(x) => str.tostring(x, "#.00")
+usd(x) => "$" + str.tostring(x, "#.00")
+dirText(d) => na(d) ? "n/a" : d > 0 ? "naik" : d < 0 ? "turun" : "datar"
+
+var string card = "📈XAUUSD📈\nDirection: No Trade\nAlasan: belum ada setup"
+var line[] lvlLines = array.new_line()
+var label[] lvlLabels = array.new_label()
+
+if conflict
+    card := "📈XAUUSD📈\nDirection: No Trade\nAlasan: trigger Buy dan Sell muncul bersamaan"
+    label.new(bar_index, high, "No Trade\nBuy & Sell bertabrakan", color = color.gray, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+else if sellSignal or buySignal
+    isSell = sellSignal
+    isCt   = isSell ? sellIsCt : buyIsCt
+    dirMul = isSell ? -1.0 : 1.0
+    entry  = close
+    sl     = entry - dirMul * slDist
+    tp1    = entry + dirMul * slDist * 0.5
+    tp2    = entry + dirMul * slDist
+    tp3    = entry + dirMul * slDist * 2
+    perPt  = lotSize * contract
+    trig   = isSell ? (sellDivOk ? "divergence RSI" : "rejection candle") : (buyDivOk ? "divergence RSI" : "rejection candle")
+    dirStr = (isSell ? "Sell" : "Buy") + (isCt ? " (counter-trend)" : "")
+
+    string s = "📈XAUUSD📈\nDirection: " + dirStr
+    s := s + "\nEntry price: " + fmt(entry)
+    s := s + "\n💰TP1: " + fmt(tp1) + " (+" + usd(perPt * slDist * 0.5) + ")"
+    s := s + "\n💰TP2: " + fmt(tp2) + " (+" + usd(perPt * slDist) + ")"
+    s := s + "\n💰TP3: " + fmt(tp3) + " (+" + usd(perPt * slDist * 2) + ")"
+    s := s + "\n⛔️SL: " + fmt(sl) + " (-" + usd(perPt * slDist) + ")"
+    s := s + "\n📦Lot: " + str.tostring(lotSize, "#.###") + " (max rugi " + usd(maxLoss) + ")"
+    s := s + "\nTrigger: " + trig + " | DXY " + dirText(dxyDir) + " | US10Y " + dirText(yieldDir)
+    if not slFull
+        s := s + "\nCatatan: SL dipersempit ke " + str.tostring(slDist, "#.0") + " poin (2x ATR = " + str.tostring(slAtr, "#.0") + ")"
+    card := s
+
+    for l in lvlLines
+        line.delete(l)
+    for lb in lvlLabels
+        label.delete(lb)
+    array.clear(lvlLines)
+    array.clear(lvlLabels)
+    prices = array.from(entry, tp1, tp2, tp3, sl)
+    names  = array.from("Entry", "TP1", "TP2", "TP3", "SL")
+    colors = array.from(color.gray, color.green, color.green, color.green, color.red)
+    for i = 0 to 4
+        p = array.get(prices, i)
+        c = array.get(colors, i)
+        array.push(lvlLines, line.new(bar_index, p, bar_index + 30, p, color = c, style = i == 0 ? line.style_solid : line.style_dashed))
+        array.push(lvlLabels, label.new(bar_index + 30, p, array.get(names, i) + " " + fmt(p), color = c, textcolor = color.white, style = label.style_label_left, size = size.small))
+
+    label.new(bar_index, isSell ? high : low, (isSell ? "SELL" : "BUY") + (isCt ? " CT" : ""), color = isSell ? color.red : color.green, textcolor = color.white, style = isSell ? label.style_label_down : label.style_label_up, size = size.small)
+    alert(card, alert.freq_once_per_bar_close)
+else if confirmed and (sellTrig or buyTrig)
+    reason = sellTrig ? sellReason : buyReason
+    card := "📈XAUUSD📈\nDirection: No Trade\nAlasan: " + reason
+    label.new(bar_index, sellTrig ? high : low, "No Trade\n" + reason, color = color.new(color.gray, 20), textcolor = color.white, style = sellTrig ? label.style_label_down : label.style_label_up, size = size.tiny)
+
+alertcondition(sellSignal and not conflict, "Sell XAUUSD", "Sinyal SELL XAUUSD terkonfirmasi")
+alertcondition(buySignal and not conflict, "Buy XAUUSD", "Sinyal BUY XAUUSD terkonfirmasi")
+
+// ---------- Panel ----------
+var table panel = table.new(position.top_right, 1, 1, bgcolor = color.new(color.black, 15))
+if barstate.islast
+    string info = card
+    info := info + "\n\n— Kondisi sekarang —"
+    info := info + "\nEMA 200: harga " + (close > ema200 ? "di atas (bias Buy)" : "di bawah (bias Sell)") + (sideways ? ", sideways" : "")
+    info := info + "\nRSI: " + str.tostring(rsi, "#.0") + " | ATR: " + str.tostring(atr, "#.00")
+    info := info + "\nSL 2x ATR: " + str.tostring(slAtr, "#.0") + " poin -> " + (slOk ? "lot " + str.tostring(lotSize, "#.###") : "terlalu lebar untuk " + usd(maxLoss))
+    info := info + "\nDXY: " + dirText(dxyDir) + " | US10Y: " + dirText(yieldDir)
+    table.cell(panel, 0, 0, info, text_color = color.white, text_halign = text.align_left, text_size = size.small)
